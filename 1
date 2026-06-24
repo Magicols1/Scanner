@@ -760,16 +760,17 @@ local function readOneCode(folder)
 	return #code == 4 and code or nil
 end
 local function readCasinoCode()
-	pcall(function() LP:RequestStreamAroundAsync(casinoWorldPos()) end)
+	local pos = casinoWorldPos()
 	local t0 = os.clock()
 	repeat
-		if #casinoCodeFolders() > 0 then break end
-		task.wait(0.15)
-	until os.clock() - t0 > 4
-	local counts, best, bc = {}, nil, 0
-	for _, f in ipairs(casinoCodeFolders()) do local code = readOneCode(f); if code then counts[code] = (counts[code] or 0) + 1 end end
-	for code, n in pairs(counts) do if n > bc then bc, best = n, code end end
-	return best
+		pcall(function() LP:RequestStreamAroundAsync(pos) end)  -- re-request each cycle: the digit parts may still be streaming
+		local counts, best, bc = {}, nil, 0
+		for _, f in ipairs(casinoCodeFolders()) do local code = readOneCode(f); if code then counts[code] = (counts[code] or 0) + 1 end end
+		for code, n in pairs(counts) do if n > bc then bc, best = n, code end end
+		if best then return best end                            -- got a valid 4-digit code -> done
+		task.wait(0.25)
+	until os.clock() - t0 > 8
+	return nil
 end
 
 local function snapshot()
