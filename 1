@@ -52,7 +52,11 @@ local CONFIG = {
 -- ==== ACCOUNT GATE: only scanner accounts ====
 local LP = Players.LocalPlayer
 if not LP then repeat task.wait() until Players.LocalPlayer; LP = Players.LocalPlayer end
+-- resolve the executor's queue-on-teleport under any common name (self-rerun depends on it; if nil the chain hops ONCE)
+local QOT = queue_on_teleport or (syn and syn.queue_on_teleport) or queueonteleport or (fluxus and fluxus.queue_on_teleport)
+print(("[ROBSCAN] boot: user=%s  queue_on_teleport=%s"):format(LP.Name, QOT and "YES" or "NO -> needs autoexec to survive hops"))
 if not string.find(LP.Name:lower(), "robberyscanner", 1, true) then
+	warn("[ROBSCAN] '" .. LP.Name .. "' is NOT a scanner account (username needs 'robberyscanner') -> idle")
 	return -- not a scanner account; do nothing
 end
 -- block a genuine double-run, but NOT the post-teleport autoexec run: Potassium's _G can persist across hops, so a
@@ -796,7 +800,7 @@ local function stopRequested()
 end
 local _queued = false
 local function persist()
-	if _queued or not queue_on_teleport then return end  -- queue the re-loader ONCE per run (the guard dedups any extras anyway)
+	if _queued or not QOT then return end  -- queue the re-loader ONCE per run (the guard dedups any extras anyway)
 	_queued = true
 	if CONFIG.SelfUrl == "" then
 		if CONFIG.SelfSource ~= "" then pcall(queue_on_teleport, CONFIG.SelfSource) end
@@ -820,7 +824,8 @@ if not fresh then
 end
 if s then local f=loadstring(s); if f then f() end end
 ]==]):format(CONFIG.SelfUrl, cache, cache)
-	pcall(queue_on_teleport, loader)
+	local ok = pcall(QOT, loader)
+	if CONFIG.DebugPrint then print("[ROBSCAN] queued self-reloader for next hop: " .. tostring(ok)) end
 end
 local function serverHop(depth)
 	depth = depth or 0
