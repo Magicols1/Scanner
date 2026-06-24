@@ -30,7 +30,7 @@ local CONFIG = {
 
 	-- ==== HOP / SCAN ====
 	Hop = true,               -- server-hop after each scan
-	MinSecPerServer = 5,     -- stay at least this long per server -> fewer teleports -> less stress on the executor's re-inject (raise if it still breaks)
+	MinSecPerServer = 0,     -- stay at least this long per server -> fewer teleports -> less stress on the executor's re-inject (raise if it still breaks)
 	StreamPlane = false,      -- OFF by default: RequestStreamAroundAsync + camera move is the one call most likely to crash the executor on a fresh-arrival; plane timing degrades to status/approx when off
 	SettleSec = 7,            -- max wait after join for robbery state to replicate
 	StreamWait = 3,           -- seconds after settling to let the game spawn the plane + replicate state
@@ -64,7 +64,7 @@ end
 -- block a genuine double-run, but NOT the post-teleport autoexec run: Potassium's _G can persist across hops, so a
 -- stale _running would wrongly block the next server (= "sometimes doesn't execute"). Only honor it if a run actually
 -- started in the last 25s (a live scan); older than that the previous run died/teleported, so let this one go.
-if _G.__robscan and _G.__robscan._running and _G.__robscan.startedAt and (os.time() - _G.__robscan.startedAt) < 5 then
+if _G.__robscan and _G.__robscan._running and _G.__robscan.startedAt and (os.time() - _G.__robscan.startedAt) < 0 then
 	warn("[ROBSCAN] already running this session")
 	return
 end
