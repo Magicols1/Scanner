@@ -798,11 +798,29 @@ local _queued = false
 local function persist()
 	if _queued or not queue_on_teleport then return end  -- queue the re-loader ONCE per run (the guard dedups any extras anyway)
 	_queued = true
-	if CONFIG.SelfUrl ~= "" then
-		pcall(queue_on_teleport, ('loadstring(game:HttpGet("%s"))()'):format(CONFIG.SelfUrl))
-	elseif CONFIG.SelfSource ~= "" then
-		pcall(queue_on_teleport, CONFIG.SelfSource)
+	if CONFIG.SelfUrl == "" then
+		if CONFIG.SelfSource ~= "" then pcall(queue_on_teleport, CONFIG.SelfSource) end
+		return
 	end
+	-- Re-loader queued for the next arrival. It prefers a FRESH LOCAL CACHE (so 5 bots don't hammer raw.githubusercontent
+	-- -> 429), only refetches when the cache is stale, and falls back to the cache if a fetch ever fails -> the self-rerun
+	-- chain survives GitHub/network blips. Cache is per-account so the 5 don't clobber each other.
+	local cache = "robscan_self_" .. tostring(LP.UserId) .. ".lua"
+	local loader = ([==[
+local u,c,tsf=%q,%q,%q..".ts"
+local s,fresh
+if isfile and isfile(c) and isfile(tsf) then
+	local t=tonumber(readfile(tsf)) or 0
+	if os.time()-t<600 then s=readfile(c); fresh=true end
+end
+if not fresh then
+	local ok,r=pcall(function() return game:HttpGet(u) end)
+	if ok and type(r)=="string" and #r>200 then s=r; pcall(function() writefile(c,r); writefile(tsf,tostring(os.time())) end)
+	elseif isfile and isfile(c) then s=readfile(c) end
+end
+if s then local f=loadstring(s); if f then f() end end
+]==]):format(CONFIG.SelfUrl, cache, cache)
+	pcall(queue_on_teleport, loader)
 end
 local function serverHop(depth)
 	depth = depth or 0
