@@ -1,0 +1,963 @@
+--[[ ROBBERY SCANNER â€” server-hopping scout (detection only; main autorob reads the report)
+
+  Runs ONLY on accounts whose username contains "RobberyScanner". Crawls servers; on each one
+  scans robberies, reports the open ones (with an absolute despawn time + a join link), then hops.
+
+  SHARED BRAIN: scouts coordinate through CONFIG.BrainUrl (a read/write JSON endpoint). Each scout
+    avoids servers already VISITED or CLAIMED by another scout, so they don't pile into one server.
+
+  DESPAWN THROUGH TIME ALONE: despawnAt / ePromptsAt are absolute UNIX timestamps. Discord renders
+    them as <t:..:R> (live, self-updating). The autorob reads despawnAt and does despawnAt - os.time().
+
+  STREAMING: on join the plane crates + onboard players are unloaded; we point the camera at the
+    plane and RequestStreamAround it, then wait for the crate count to stabilise before reporting.
+
+  SELF-EXECUTE: drop in the Potassium autoexec folder. Halt with a robscan_stop.txt in the workspace.
+  SET: CONFIG.BotUrl + CONFIG.RobberyToken (the Discord bot's /robbery endpoint + shared secret).
+]]
+
+local RS = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+
+-- ==== CONFIG ====
+local CONFIG = {
+	-- ==== BOT (the ONLY output: POST live robbery states to the Discord bot) ====
+	BotUrl = "https://buster-production-930c.up.railway.app/robbery",               -- your Railway bot URL + /robbery  e.g.  https://buster-production.up.railway.app/robbery
+	RobberyToken = "090910293021", -- <-- PUT THE TOKEN HERE. must equal the bot's ROBBERY_TOKEN env var on Railway.
+
+	-- ==== HOP / SCAN ====
+	Hop = true,               -- server-hop after each scan
+	SettleSec = 7,            -- max wait after join for robbery state to replicate
+	StreamWait = 3,           -- seconds after settling to let the game spawn the plane + replicate state
+	RevisitCooldown = 600,    -- seconds before any scout may revisit a JobId
+	ClaimTTL = 90,            -- seconds a "planning to join" claim holds
+	StopFile = "robscan_stop.txt",
+	DebugPrint = true,
+	SelfSource = "",          -- optional queue_on_teleport payload if NOT using autoexec
+
+	-- ==== SERVER-HOP COORDINATION ====
+	-- blank = LOCAL (visited file + direct Roblox server list). Set the Worker URLs to share visited/claims across scouts.
+	BrainUrl = "",
+	ServersUrl = "",
+	BrainHeaders = {},
+	BrainPutMethod = "POST",
+}
+
+-- ==== ACCOUNT GATE: only scanner accounts ====
+local LP = Players.LocalPlayer
+if not LP then repeat task.wait() until Players.LocalPlayer; LP = Players.LocalPlayer end
+if not string.find(LP.Name:lower(), "robberyscanner", 1, true) then
+	return -- not a scanner account; do nothing
+end
+-- block a genuine double-run, but NOT the post-teleport autoexec run: Potassium's _G can persist across hops, so a
+-- stale _running would wrongly block the next server (= "sometimes doesn't execute"). Only honor it if a run actually
+-- started in the last 25s (a live scan); older than that the previous run died/teleported, so let this one go.
+if _G.__robscan and _G.__robscan._running and _G.__robscan.startedAt and (os.time() - _G.__robscan.startedAt) < 25 then
+	warn("[ROBSCAN] already running this session")
+	return
+end
+-- seed per-account so scouts shuffle/pick DIFFERENT servers (UserId is the differentiator)
+math.randomseed(LP.UserId + math.floor(os.clock() * 1000) + os.time())
+
+-- ==== HELPERS ====
+local function child(root, ...)
+	local node = root
+	for _, seg in ipairs({ ... }) do
+		if not node then return nil end
+		node = node:FindFirstChild(seg)
+	end
+	return node
+end
+local function req(inst)
+	if not inst then return nil end
+	local ok, m = pcall(require, inst)
+	return ok and m or nil
+end
+local function shuffle(t)
+	for i = #t, 2, -1 do
+		local j = math.random(i)
+		t[i], t[j] = t[j], t[i]
+	end
+end
+
+local Consts, Time, PlaneShared -- required LAZILY (autoexec runs before these replicate); (re)loaded by loadConsts()
+local httpFn = (syn and syn.request) or http_request or request or (http and http.request) or (fluxus and fluxus.request)
+
+local function nowSync()
+	if Time and Time.GetNowSync then
+		local ok, t = pcall(Time.GetNowSync)
+		if ok and t then return t end
+	end
+	return os.clock()
+end
+
+-- ==== UNIVERSAL STATE ====
+local stateFolderName
+local idToName = {}
+-- (re)resolve the robbery modules + id map; safe to call repeatedly. Returns true once RobberyConsts is available.
+local function loadConsts()
+	Consts = Consts or req(child(RS, "Robbery", "RobberyConsts"))
+	Time = Time or req(child(RS, "Module", "Time"))
+	PlaneShared = PlaneShared or req(child(RS, "Game", "Robbery", "RobberyCargoPlaneShared"))
+	if not Consts then return false end
+	stateFolderName = Consts.ROBBERY_STATE_FOLDER_NAME
+	if Consts.LIST_ROBBERY and Consts.ENUM_ROBBERY then
+		table.clear(idToName)
+		for _, name in ipairs(Consts.LIST_ROBBERY) do
+			local id = Consts.ENUM_ROBBERY[name]
+			if id ~= nil then idToName[id] = name end
+		end
+	end
+	return true
+end
+loadConsts() -- try now (may be too early on autoexec -> retried after game.Loaded in the main loop)
+-- how many state children we expect once fully replicated = number of robberies; fills in after loadConsts succeeds
+-- (0 while Consts is still missing -> the settle loop falls back to signature-stability alone)
+local function expectedStateCount()
+	local n = 0
+	for _ in pairs(idToName) do n += 1 end
+	return n
+end
+local function statusWord(v)
+	if not Consts then return tostring(v) end
+	local E = Consts.ENUM_STATUS
+	if v == E.OPENED then return "open"
+	elseif v == E.STARTED then return "in_progress"
+	elseif v == E.CLOSED then return "closed"
+	else return "unknown" end
+end
+local function readStates()
+	local out = {}
+	local folder = stateFolderName and RS:FindFirstChild(stateFolderName)
+	if not folder then return out end
+	for _, v in ipairs(folder:GetChildren()) do
+		local id = tonumber(v.Name)
+		local name = (id and idToName[id]) or v.Name
+		local ok, val = pcall(function() return v.Value end)
+		out[name] = ok and statusWord(val) or "unknown"
+	end
+	return out
+end
+local function canReadState()
+	return Consts ~= nil and stateFolderName ~= nil and RS:FindFirstChild(stateFolderName) ~= nil
+end
+
+-- ==== CARGO PLANE FLIGHT TIMING ====
+local planeOffsets, planePaths
+local function loadPlaneFlight()
+	if not (PlaneShared and PlaneShared.GetFlightData) then return end
+	local ok, fd = pcall(PlaneShared.GetFlightData)
+	if not ok or not fd or type(fd.SeqsLayout) ~= "table" then return end
+	local t, marks = 0, {}
+	for _, seq in ipairs(fd.SeqsLayout) do
+		marks[seq[1]] = { start = t, dur = seq[2] }
+		t += seq[2]
+	end
+	local enter, leave = marks.SeqEnter, marks.SeqLeave
+	planeOffsets = {
+		arrival = enter and (enter.start + enter.dur) or nil,
+		ePrompts = leave and (leave.start + 0.2 * leave.dur) or nil,
+		depart = leave and leave.start or nil,
+		despawn = t,
+	}
+	if fd.PathEnter and fd.PathLeave and enter and leave then
+		pcall(function() fd.PathEnter.ApproxTotalLength = fd.PathEnter:ApproximateLength(1000) end)
+		pcall(function() fd.PathLeave.ApproxTotalLength = fd.PathLeave:ApproximateLength(1000) end)
+		planePaths = { enter = fd.PathEnter, leave = fd.PathLeave,
+			enterStart = enter.start, enterDur = enter.dur, leaveStart = leave.start, leaveDur = leave.dur }
+	end
+end
+
+local cargo = { bornAt = nil, bornAtKnown = false }
+local function findPlaneModel()
+	for _, inst in ipairs(CollectionService:GetTagged("RobberyMarker")) do
+		if inst.Name == "CargoPlane" then
+			local m = inst.Parent
+			if m and m:IsA("Model") and m.PrimaryPart then return m end
+			if inst:IsA("BasePart") then return inst end
+		end
+	end
+	return nil
+end
+local function easedToLinear(v)
+	v = math.clamp(v, 0, 1)
+	return (math.asin(math.clamp(2 * v - 1, -1, 1)) + math.pi / 2) / math.pi
+end
+local function nearestFrac(path, pos, samples)
+	local bestF, bestD = 0, math.huge
+	local len = path.ApproxTotalLength or path:ApproximateLength(1000)
+	for i = 0, samples do
+		local f = i / samples
+		local ok, p = pcall(function() return (path:GetWorldPositionAt(len * f)) end)
+		if ok and p then
+			local d = (p - pos).Magnitude
+			if d < bestD then bestD, bestF = d, f end
+		end
+	end
+	return bestF, bestD
+end
+local function estimateBornAt()
+	if not planePaths then return end
+	local model = findPlaneModel()
+	local part = model and (model.PrimaryPart or (model:IsA("BasePart") and model) or model:FindFirstChildWhichIsA("BasePart"))
+	if not part then return end
+	local pos = part.Position
+	local ef, ed = nearestFrac(planePaths.enter, pos, 120)
+	local lf, ld = nearestFrac(planePaths.leave, pos, 120)
+	local now = nowSync()
+	if ed <= ld and ed < 60 then
+		cargo.bornAt = now - (planePaths.enterStart + easedToLinear(ef) * planePaths.enterDur)
+		cargo.bornAtKnown = true
+	elseif ld < 60 then
+		cargo.bornAt = now - (planePaths.leaveStart + easedToLinear(lf) * planePaths.leaveDur)
+		cargo.bornAtKnown = true
+	else
+		cargo.bornAtKnown = false
+	end
+end
+
+-- ==== CARGO PLANE STATUS (Open once e-prompts have appeared) ====
+local function planeReport(states)
+	local st = states.CARGO_PLANE or "closed"
+	local r = { state = st }
+	if st == "closed" then
+		cargo.bornAt, cargo.bornAtKnown = nil, false
+		return r
+	end
+	if not cargo.bornAt then estimateBornAt() end
+	if cargo.bornAt and planeOffsets then
+		local el = nowSync() - cargo.bornAt
+		local nowU = os.time()
+		local function rem(off) return off and math.max(0, off - el) or nil end
+		local function at(off) local s = rem(off); return s and (nowU + math.floor(s + 0.5)) or nil end
+		r.bornAtKnown = cargo.bornAtKnown
+		r.secondsUntilEPrompts = rem(planeOffsets.ePrompts)
+		r.secondsUntilDespawn = rem(planeOffsets.despawn)
+		r.ePromptsAt = at(planeOffsets.ePrompts)
+		r.arrivalAt = at(planeOffsets.arrival)   -- absolute unix the plane finishes arriving at the airport (bot: "still inbound" cutoff)
+		r.departsAt = at(planeOffsets.depart)
+			r.despawnAt = at(planeOffsets.despawn)
+		-- Open once e-prompts are up, until despawn
+		r.robbableNow = (planeOffsets.ePrompts ~= nil and el >= planeOffsets.ePrompts
+			and planeOffsets.despawn ~= nil and el < planeOffsets.despawn) or false
+		r.progress = planeOffsets.despawn and math.clamp(el / planeOffsets.despawn, 0, 1) or nil -- 0..1 over the flight (for the map frame picker)
+	else
+		r.bornAtKnown = false
+	end
+	return r
+end
+
+-- Train track centerline (cargo START->END). cum=studs from cargo START. Auto-built from RailData endpoints.
+local TRACK_LEN = 10968.6
+local TRACK = {
+  {931.5,20.7,-4570,0},
+  {910.1,20.7,-4554.4,26.5},
+  {890.4,20.7,-4537.3,53.5},
+  {872.4,20.7,-4518.6,80.5},
+  {856,20.7,-4498.4,107.5},
+  {841.5,20.7,-4476.8,134.5},
+  {828.9,20.7,-4454,161.5},
+  {818.4,20.7,-4430.3,188.4},
+  {809.9,20.7,-4405.7,215.4},
+  {803.6,20.7,-4380.4,242.4},
+  {799.6,20.7,-4354.7,269.4},
+  {797.8,20.7,-4328.8,296.4},
+  {798.3,20.7,-4302.8,323.4},
+  {801,20.7,-4276.9,350.4},
+  {806,20.7,-4251.4,377.3},
+  {813.2,20.7,-4226.4,404.3},
+  {822.5,20.7,-4202.1,431.3},
+  {834,20.7,-4178.7,458.3},
+  {849.2,20.7,-4153.5,488.8},
+  {868,20.7,-4127.6,523.6},
+  {889.1,20.7,-4103.5,558.4},
+  {1651,20.7,-3367.8,1618.9},
+  {1669.2,20.7,-3346.8,1647.5},
+  {1685.5,20.7,-3324.4,1675.6},
+  {1699.8,20.7,-3300.6,1703.7},
+  {1711.9,20.7,-3275.8,1731.8},
+  {1721.8,20.7,-3249.9,1759.9},
+  {1729.4,20.7,-3223.3,1788},
+  {1734.7,20.7,-3196.1,1816.1},
+  {1737.6,20.7,-3168.5,1844.2},
+  {1738.1,20.7,-3140.8,1872.3},
+  {1736.1,20.7,-3113.2,1900.4},
+  {1731.8,20.7,-3085.9,1928.6},
+  {1725.1,20.7,-3059,1956.7},
+  {1716.1,20.7,-3032.8,1984.8},
+  {1684.5,20.7,-2961.8,2063.5},
+  {1626.3,25.7,-2831.3,2207.5},
+  {1613.5,25.7,-2802.5,2239.6},
+  {1601.8,25.7,-2768.5,2277},
+  {1593.1,25.7,-2733.5,2314.4},
+  {1587.5,25.7,-2697.9,2351.8},
+  {1585.1,25.7,-2662,2389.1},
+  {1585.7,25.7,-2626,2426.5},
+  {1589.5,25.7,-2590.2,2463.9},
+  {1596.4,25.7,-2554.8,2501.3},
+  {1618.2,28.5,-2478.9,2581.7},
+  {1625,28.5,-2443.6,2619.1},
+  {1628.8,28.5,-2407.8,2656.5},
+  {1629.4,28.4,-2371.8,2693.9},
+  {1626.8,28.4,-2335.9,2731.3},
+  {1584.3,36.7,-2094.9,2977},
+  {1569.7,36.6,-2012.2,3061.5},
+  {1566.4,36.5,-1973.8,3101.3},
+  {1566.4,36.5,-1935.3,3141.2},
+  {1569.8,36.5,-1896.9,3181.1},
+  {1576.5,36.5,-1859,3221},
+  {1586.5,36.5,-1821.8,3260.9},
+  {1599.7,36.5,-1785.6,3300.8},
+  {1616.1,36.6,-1750.5,3340.8},
+  {1739.7,36.6,-1497.3,3623.7},
+  {1753.1,37,-1463.9,3662.7},
+  {1764.3,36.9,-1427.3,3701.2},
+  {1772.3,36.8,-1389.8,3739.7},
+  {1777,36,-1351.8,3778.1},
+  {1778.3,35.2,-1313.5,3816.6},
+  {1776.3,34.4,-1275.2,3855.1},
+  {1771,33.6,-1237.3,3893.6},
+  {1762.4,32.8,-1199.9,3932},
+  {1750.5,32.1,-1163.5,3970.5},
+  {1703.6,29.8,-1053,4090.7},
+  {1685.2,28.6,-996.2,4151.9},
+  {1595.2,20.5,-605.8,4553.3},
+  {1575.2,19,-519,4643.4},
+  {1566,18.1,-466.8,4698.4},
+  {1560.3,17.1,-412.6,4753},
+  {1556.6,15.9,-342.4,4824},
+  {1531.5,15.9,136.9,5313.2},
+  {1523.6,15.9,201.2,5379},
+  {1516.5,15.9,237.7,5417.2},
+  {1508,15.9,269.6,5450.4},
+  {1497.2,15.9,300.8,5483.6},
+  {1484.3,15.9,331.3,5516.7},
+  {1469.2,15.9,360.7,5549.8},
+  {1454.6,15.9,385.2,5578.4},
+  {1438.2,15.9,408.5,5606.9},
+  {1420.3,15.9,430.6,5635.4},
+  {1400.9,15.9,451.4,5663.9},
+  {1380,15.9,470.9,5692.4},
+  {1357.9,15.9,488.8,5720.9},
+  {1334.6,15.9,505.1,5749.5},
+  {1086,15.9,648.6,6036.5},
+  {1061.2,15.9,661.8,6065},
+  {1035.9,15.9,674.2,6093.4},
+  {1010.1,15.9,685.6,6121.8},
+  {775,15.9,780.6,6375.6},
+  {750.1,15.9,792.8,6404.5},
+  {726.7,15.9,806.4,6434.1},
+  {704.3,15.9,821.6,6463.6},
+  {683.4,15.9,838.1,6492.2},
+  {670.1,15.9,850,6511.1},
+  {657.8,15.9,862.9,6530.1},
+  {646.3,15.9,876.6,6549},
+  {635.9,15.9,891.1,6568},
+  {628.9,15.9,902.3,6582.3},
+  {622.8,15.9,914,6596.7},
+  {617.4,15.9,926.2,6611.1},
+  {612.9,15.9,938.6,6625.4},
+  {609.3,15.9,951.4,6639.8},
+  {606.6,15.9,964.3,6654.1},
+  {604.8,15.9,977.4,6668.5},
+  {603.9,15.9,990.6,6682.8},
+  {604,15.9,1003.9,6697.2},
+  {604.9,15.9,1017.1,6711.5},
+  {629.9,15.9,1194.3,6891.4},
+  {636.2,15.9,1230.2,6928.5},
+  {696.4,15.9,1513.4,7218.6},
+  {701.6,15.9,1549.8,7255.4},
+  {703.2,15.9,1572.8,7278.4},
+  {703.2,15.9,1591.1,7296.9},
+  {701.9,15.9,1609.5,7315.3},
+  {700,15.9,1623.1,7329.1},
+  {697.1,15.9,1636.6,7342.9},
+  {693.3,15.9,1649.8,7356.8},
+  {688.6,15.9,1662.8,7370.6},
+  {683,15.9,1675.4,7384.4},
+  {676.9,15.9,1687.7,7398.3},
+  {670,15.9,1699.7,7412.1},
+  {662.3,15.9,1711.1,7425.9},
+  {653.9,15.9,1721.9,7439.7},
+  {645,15.9,1732.5,7453.6},
+  {635.8,15.9,1742.8,7467.4},
+  {626.2,15.9,1752.7,7481.2},
+  {616.3,15.9,1762.2,7495},
+  {606,15.9,1771.5,7508.8},
+  {595.1,15.9,1780,7522.6},
+  {583.7,15.9,1787.7,7536.5},
+  {571.8,15.9,1794.6,7550.3},
+  {559.4,15.9,1800.6,7564.1},
+  {546.6,15.9,1805.8,7577.9},
+  {533.5,15.9,1810,7591.7},
+  {520.1,15.9,1813.4,7605.6},
+  {506.6,15.9,1815.7,7619.4},
+  {492.9,15.9,1817.2,7633.2},
+  {479.1,15.9,1817.6,7647},
+  {465.3,15.9,1817.2,7660.9},
+  {451.6,15.9,1815.7,7674.7},
+  {438,15.9,1813.8,7688.5},
+  {-259.3,15.9,1665.6,8401.4},
+  {-295.1,15.9,1660.6,8438.9},
+  {-331.3,15.9,1658.1,8476.2},
+  {-399.8,15.9,1658.1,8545.8},
+  {-626.6,23.9,1658.1,8778.7},
+  {-663.4,25.2,1656.8,8815.6},
+  {-700.1,26.5,1654.3,8852.4},
+  {-736.6,27.8,1650.4,8889.2},
+  {-772.8,29,1644,8926},
+  {-804,30.1,1636.2,8958.2},
+  {-838.9,30,1625,8995.2},
+  {-873.5,30,1612.5,9032.1},
+  {-907.6,30,1598.7,9068.9},
+  {-932.8,30,1587.5,9096.5},
+  {-957.1,30,1574.5,9124.1},
+  {-973.1,30,1565.3,9142.5},
+  {-988.3,30,1555,9161},
+  {-999.1,30,1546.6,9174.8},
+  {-1009.4,30,1537.4,9188.6},
+  {-1019,30,1527.4,9202.5},
+  {-1027.9,30,1516.8,9216.3},
+  {-1036,30,1505.6,9230.2},
+  {-1077.4,30,1439.3,9308.4},
+  {-1084.3,30,1427.4,9322.2},
+  {-1090.8,30,1415.2,9336},
+  {-1096.8,30,1402.8,9349.8},
+  {-1113.7,30,1365,9391.2},
+  {-1129.2,30,1326.6,9432.7},
+  {-1160.6,26.8,1240.2,9524.7},
+  {-1231.4,19.6,1045.6,9738.9},
+  {-1269.1,15.8,942.1,9849.5},
+  {-1280.5,15.8,902.3,9890.9},
+  {-1287.2,15.8,870.9,9923.1},
+  {-1291.7,15.8,839,9955.3},
+  {-1293,15.8,820.7,9973.8},
+  {-1293,15.8,802.3,9992.2},
+  {-1292.3,15.8,783.9,10010.6},
+  {-1290.4,15.8,765.6,10029},
+  {-1287.2,15.8,747.5,10047.4},
+  {-1282.8,15.8,729.7,10065.9},
+  {-1277.1,15.8,712.2,10084.3},
+  {-1270.2,15.8,695.2,10102.7},
+  {-1240,15.8,633.2,10171.7},
+  {-1233.3,15.8,616.6,10190.7},
+  {-1227.8,15.8,599.6,10209.6},
+  {-1223.5,15.8,582.2,10228.5},
+  {-1220.4,15.8,564.6,10247.4},
+  {-1218.6,15.8,546.8,10266.3},
+  {-1218,15.8,529,10285.3},
+  {-1218.6,15.8,511.2,10304.2},
+  {-1220.5,15.8,493.4,10323.2},
+  {-1223,15.8,475.5,10341.9},
+  {-1226.8,15.8,458,10360.8},
+  {-1231.7,15.8,440.8,10379.8},
+  {-1237.9,15.8,424,10398.7},
+  {-1245.2,16.4,407.7,10417.6},
+  {-1253.1,17,391.5,10436.3},
+  {-1261.6,17.7,375.5,10454.9},
+  {-1271.1,18.3,360.4,10473.9},
+  {-1281.6,18.9,346,10492.9},
+  {-1293.1,19.5,332.3,10511.8},
+  {-1305.6,20.1,319.5,10530.7},
+  {-1318.8,20.6,307.6,10549.7},
+  {-1332.9,21.2,296.6,10568.7},
+  {-1347.7,21.7,286.7,10587.6},
+  {-1363.2,22.2,277.8,10606.6},
+  {-1375,22.6,272,10621},
+  {-1387.3,22.4,267.1,10635.4},
+  {-1399.9,22.3,263,10649.7},
+  {-1412.8,22.1,259.8,10664.1},
+  {-1425.8,22,257.6,10678.5},
+  {-1439,21.8,256.2,10692.8},
+  {-1466.2,21.3,254.3,10720.7},
+  {-1504.8,21.3,251.6,10768.8},
+  {-1522.9,21.2,251.6,10787.5},
+  {-1540.7,21.1,252.9,10806.4},
+  {-1558.4,21,255.4,10825.4},
+  {-1617,20.4,265.7,10885.5},
+  {-1635.1,20.4,268.9,10913.1},
+  {-1653.4,20.3,270.8,10931.6},
+  {-1671.8,20.1,272.1,10950.1},
+  {-1690.1,19.9,273.1,10968.6},
+}
+
+-- ==== TRAIN DESPAWN TIMING ====
+-- Cargo & passenger trains run the fixed world track (TRACK centerline above, cum = studs from the cargo START). Both
+-- move ~67.5 st/s and despawn when their marker reaches the far end. We read the server-bound RobberyMarker (named
+-- TrainCargo / TrainPassenger -- present even before the train mesh streams in), project it onto the centerline ->
+-- remaining distance -> ETA. Cargo despawns at the END (remaining = TRACK_LEN - cum); passenger runs the reverse and
+-- despawns at the START (remaining = cum). Coords are identical on every server, so this works the instant we join.
+local TRAIN_SPEED = 67.5
+local TRAIN_OFF_MAX = 30 -- marker farther than this from the line -> projection untrusted (timing approximate)
+
+local function projTrack(px, py, pz)
+	local bestD, bestCum = math.huge, 0
+	for i = 2, #TRACK do
+		local a, b = TRACK[i - 1], TRACK[i]
+		local abx, aby, abz = b[1] - a[1], b[2] - a[2], b[3] - a[3]
+		local abl = abx * abx + aby * aby + abz * abz
+		local t = 0
+		if abl > 0 then t = ((px - a[1]) * abx + (py - a[2]) * aby + (pz - a[3]) * abz) / abl end
+		if t < 0 then t = 0 elseif t > 1 then t = 1 end
+		local dx, dy, dz = a[1] + abx * t - px, a[2] + aby * t - py, a[3] + abz * t - pz
+		local d = dx * dx + dy * dy + dz * dz
+		if d < bestD then bestD, bestCum = d, a[4] + (b[4] - a[4]) * t end
+	end
+	return bestCum, math.sqrt(bestD)
+end
+
+local function trainMarkerPos(name)
+	for _, m in ipairs(CollectionService:GetTagged("RobberyMarker")) do
+		if m.Name == name then
+			if m:IsA("BasePart") then return m.Position end
+			if m:IsA("Model") then local ok, cf = pcall(function() return m:GetPivot() end); if ok then return cf.Position end end
+		end
+	end
+	return nil
+end
+
+local function oneTrain(name, remainOf)
+	local pos = trainMarkerPos(name)
+	if not pos then return nil end
+	local cum, off = projTrack(pos.X, pos.Y, pos.Z)
+	local secs = math.max(0, remainOf(cum)) / TRAIN_SPEED
+	return {
+		present = true,
+		secondsUntilDespawn = secs,
+		despawnAt = os.time() + math.floor(secs + 0.5),
+		offPath = off,
+		timingApprox = (off > TRAIN_OFF_MAX) or nil,
+		progress = math.clamp(cum / TRACK_LEN, 0, 1), -- physical position along the track (same frame set for both trains)
+	}
+end
+
+local function trainReport()
+	local cargo = oneTrain("TrainCargo", function(cum) return TRACK_LEN - cum end)
+	local passenger = oneTrain("TrainPassenger", function(cum) return cum end)
+	if not cargo and not passenger then return nil end
+	return { cargo = cargo, passenger = passenger }
+end
+
+-- ==== STATIONARY ROBBERY COUNTDOWN ====
+-- Each robbery ships its own <Marker>RobberyConsts ModuleScript: TIMEOUT_PERIOD (how long it stays OPEN) + the NAME of
+-- a "status changed at" attribute (a stamp set when it last opened). closesAt = StatusChangedAt + TIMEOUT_PERIOD.
+local robConsts = {}    -- markerBase ("Tomb") -> { timeout, changedAttr, statusAttr }
+local nameToMarker = {} -- enum name ("TOMB") -> markerBase ("Tomb")
+local function buildRobConsts()
+	if Consts and Consts.DATA_ROBBERY then
+		for id, data in pairs(Consts.DATA_ROBBERY) do
+			local nm = idToName[id]
+			if nm and type(data) == "table" and data.markerName then nameToMarker[nm] = data.markerName end
+		end
+	end
+	for _, m in ipairs(RS:GetDescendants()) do
+		if m:IsA("ModuleScript") and m.Name ~= "RobberyConsts" and m.Name:match("RobberyConsts$") then
+			local c = req(m)
+			if type(c) == "table" and (c.TIMEOUT_PERIOD or c.STATUS_CHANGED_AT_ATTR_NAME) then
+				robConsts[(m.Name:gsub("RobberyConsts$", ""))] =
+					{ timeout = c.TIMEOUT_PERIOD, changedAttr = c.STATUS_CHANGED_AT_ATTR_NAME, statusAttr = c.STATUS_ATTR_NAME }
+			end
+		end
+	end
+end
+local function readAttrAnywhere(id, base, attr)
+	local folder = stateFolderName and RS:FindFirstChild(stateFolderName)
+	local sv = folder and id and folder:FindFirstChild(tostring(id))
+	local v
+	if sv then v = sv:GetAttribute(attr); if type(v) == "number" then return v, "state" end end
+	if folder then v = folder:GetAttribute(attr); if type(v) == "number" then return v, "folder" end end
+	if base then
+		for _, mk in ipairs(CollectionService:GetTagged("RobberyMarker")) do
+			if mk.Name == base then v = mk:GetAttribute(attr); if type(v) == "number" then return v, "marker" end end
+		end
+	end
+	return nil
+end
+-- secondsLeft, closesAtUnix, debugSrc  (nil if we can't time it -> robbery reported status-only)
+local function stationaryTiming(name)
+	local base = nameToMarker[name]
+	local rc = base and robConsts[base]
+	if not (rc and rc.timeout and rc.changedAttr) then return nil end
+	local id = Consts and Consts.ENUM_ROBBERY and Consts.ENUM_ROBBERY[name]
+	local stamp, src = readAttrAnywhere(id, base, rc.changedAttr)
+	if not stamp then return nil end
+	-- stamp may be unix (~1.7e9) or a workspace clock; measure elapsed in whichever matches its magnitude
+	local elapsed = (stamp > 1e9) and (os.time() - stamp) or (nowSync() - stamp)
+	local left = math.max(0, rc.timeout - elapsed)
+	return left, os.time() + math.floor(left + 0.5), (src or "?") .. "/" .. base
+end
+
+local function snapshot()
+	local states = readStates()
+	return {
+		jobId = game.JobId,
+		placeId = game.PlaceId,
+		players = #Players:GetPlayers(),
+		maxPlayers = Players.MaxPlayers,
+		ts = os.time(),
+		robberies = states,
+		cargoPlane = planeReport(states),
+		trains = trainReport(),
+	}
+end
+
+-- ==== REPORT (smooth embed: live timers + join link, multi-robbery) ====
+local function send(method, url, body, headers)
+	local h = { ["Content-Type"] = "application/json" }
+	if headers then for k, v in pairs(headers) do h[k] = v end end
+	return pcall(httpFn, { Url = url, Method = method, Headers = h, Body = body })
+end
+local function tstamp(at) return at and ("<t:" .. at .. ":R>") or "â€”" end
+local function joinUrl(snap)
+	return ("https://www.roblox.com/games/start?placeId=%d&gameInstanceId=%s"):format(snap.placeId, tostring(snap.jobId))
+end
+local function debugLine(snap)
+	local c = snap.cargoPlane
+	if c.state == "closed" then return "[ROBSCAN] CARGO_PLANE=closed -> hop" end
+	return ("[ROBSCAN] CARGO_PLANE=%s | eprompts %ss | despawn %ss | open=%s")
+		:format(c.state, tostring(c.secondsUntilEPrompts and math.floor(c.secondsUntilEPrompts) or "?"),
+			tostring(c.secondsUntilDespawn and math.floor(c.secondsUntilDespawn) or "?"), tostring(c.robbableNow))
+end
+-- ==== BOT REPORT (the ONLY output: POST the live robbery states to the Discord bot) ====
+local TRAIN_DUR = TRACK_LEN / TRAIN_SPEED
+local SKIP_IN_LOOP = { CARGO_PLANE = true, TRAIN_CARGO = true, TRAIN_PASSENGER = true, CARGO_SHIP = true }
+local function reportBot(snap)
+	if not (httpFn and CONFIG.BotUrl ~= "") then return end
+	local list = {}
+	-- moving robberies carry startedAt (when the route began) + endsAt (despawn); the bot picks the synced gif from these
+	local c = snap.cargoPlane
+	if c and (c.state == "open" or c.state == "in_progress") and c.despawnAt and planeOffsets then
+		list[#list + 1] = { name = "CARGO_PLANE", status = c.robbableNow and "open" or "in_progress",
+			startedAt = c.despawnAt - math.floor(planeOffsets.despawn + 0.5), endsAt = c.despawnAt, arrivesAt = c.arrivalAt, departsAt = c.departsAt }
+	end
+	if snap.trains then
+		local tc, tp = snap.trains.cargo, snap.trains.passenger
+		if tc and tc.despawnAt then list[#list + 1] = { name = "TRAIN_CARGO", status = "in_progress",
+			startedAt = tc.despawnAt - math.floor(TRAIN_DUR + 0.5), endsAt = tc.despawnAt } end
+		if tp and tp.despawnAt then list[#list + 1] = { name = "TRAIN_PASSENGER", status = "in_progress",
+			startedAt = tp.despawnAt - math.floor(TRAIN_DUR + 0.5), endsAt = tp.despawnAt } end
+	end
+	-- stationary robberies: attach endsAt from each one's TIMEOUT_PERIOD + StatusChangedAt (stationaryTiming); status-only if untimed
+	for name, stt in pairs(snap.robberies) do
+		if (stt == "open" or stt == "in_progress") and not SKIP_IN_LOOP[name] then
+			local entry = { name = name, status = stt }
+			local left, endsAt, src = stationaryTiming(name)
+			if endsAt then
+				entry.endsAt = endsAt
+				if CONFIG.DebugPrint then print(("[ROBSCAN] timer %s: %ds left (closes %d) src=%s"):format(name, math.floor(left), endsAt, tostring(src))) end
+			end
+			list[#list + 1] = entry
+		end
+	end
+	if #list == 0 then return end
+	local body = HttpService:JSONEncode({
+		token = CONFIG.RobberyToken, jobId = snap.jobId, placeId = snap.placeId,
+		players = snap.players, maxPlayers = snap.maxPlayers, ts = snap.ts, robberies = list,
+	})
+	local ok, res = send("POST", CONFIG.BotUrl, body)
+	local code = (type(res) == "table" and (res.StatusCode or res.Status)) or (ok and "?" or tostring(res))
+	if CONFIG.DebugPrint then print(("[ROBSCAN] -> bot: %d robberies | ok=%s http=%s"):format(#list, tostring(ok), tostring(code))) end
+end
+
+-- ==== SHARED BRAIN (visited + claimed) ====
+local VISIT_FILE = "robscan_visited.json"
+local function localVisited()
+	if not (isfile and readfile and isfile(VISIT_FILE)) then return {} end
+	local ok, data = pcall(function() return HttpService:JSONDecode(readfile(VISIT_FILE)) end)
+	local out, now = {}, os.time()
+	if ok and type(data) == "table" then
+		for jid, exp in pairs(data) do if tonumber(exp) and exp > now then out[jid] = exp end end
+	end
+	return out
+end
+local VISIT_MAX = 20  -- it's only a short relog cooldown; keep just the N newest JobIds so the list can NEVER grow until it filters out every server (= hop deadlock)
+local function saveLocalVisited(v)
+	local arr = {}
+	for jid, exp in pairs(v) do arr[#arr + 1] = { jid, exp } end
+	if #arr > VISIT_MAX then
+		table.sort(arr, function(a, b) return a[2] > b[2] end)  -- newest expiry first
+		v = {}
+		for i = 1, VISIT_MAX do v[arr[i][1]] = arr[i][2] end
+	end
+	if writefile then pcall(function() writefile(VISIT_FILE, HttpService:JSONEncode(v)) end) end
+end
+local function statusOf(res)
+	return type(res) == "table" and (res.StatusCode or res.Status or res.status_code) or nil
+end
+local function brainGet()
+	if not (httpFn and CONFIG.BrainUrl ~= "") then return nil end
+	local ok, res = pcall(httpFn, { Url = CONFIG.BrainUrl, Method = "GET", Headers = CONFIG.BrainHeaders })
+	if ok and type(res) == "table" then
+		local code = statusOf(res)
+		if code and code ~= 200 then warn("[ROBSCAN] brain GET status " .. tostring(code) .. " â€” check BrainHeaders vs Worker AUTH") end
+		if res.Body then
+			local okd, d = pcall(function() return HttpService:JSONDecode(res.Body) end)
+			if okd and type(d) == "table" then return d end
+		end
+	end
+	return {}
+end
+local function brainPut(tbl)
+	if not (httpFn and CONFIG.BrainUrl ~= "") then return end
+	local ok, res = send(CONFIG.BrainPutMethod, CONFIG.BrainUrl, HttpService:JSONEncode(tbl), CONFIG.BrainHeaders)
+	local code = ok and statusOf(res)
+	if code and code ~= 200 then warn("[ROBSCAN] brain PUT status " .. tostring(code)) end
+end
+local function pruneBrain(b)
+	local now = os.time()
+	b.v = b.v or {}
+	b.c = b.c or {}
+	for j, e in pairs(b.v) do if not (tonumber(e) and e > now) then b.v[j] = nil end end
+	for j, e in pairs(b.c) do if not (tonumber(e) and e > now) then b.c[j] = nil end end
+	return b
+end
+-- on arrival: mark this server visited + clear our claim, so other scouts skip it
+local function markArrived()
+	local now = os.time()
+	if CONFIG.BrainUrl ~= "" then
+		local b = pruneBrain(brainGet() or {})
+		b.v[game.JobId] = now + CONFIG.RevisitCooldown
+		b.c[game.JobId] = nil
+		brainPut(b)
+	else
+		local v = localVisited()
+		v[game.JobId] = now + CONFIG.RevisitCooldown
+		saveLocalVisited(v)
+	end
+end
+
+-- ==== SERVER HOP ====
+local serverCache = {}  -- fetched once, reused across many hops; visited filter (brain.v) drains it -> re-fetch only when empty
+local function fetchServers()
+	if not httpFn then return {} end
+	-- preferred: through the Worker (Cloudflare caches the list -> no per-scout Roblox 429)
+	if CONFIG.ServersUrl ~= "" then
+		local ok, res = pcall(httpFn, { Url = CONFIG.ServersUrl .. "?placeId=" .. game.PlaceId, Method = "GET", Headers = CONFIG.BrainHeaders })
+		if ok and type(res) == "table" then
+			local code = statusOf(res)
+			if code and code ~= 200 then warn("[ROBSCAN] /servers status " .. tostring(code)) end
+			if res.Body then
+				local okd, d = pcall(function() return HttpService:JSONDecode(res.Body) end)
+				if okd and d and d.data then return d.data end
+			end
+		end
+		return {}
+	end
+	-- fallback: direct Roblox API (rate-limited; we cache the result so we only call this once per ~300 hops)
+	local all, cursor = {}, nil
+	for _ = 1, 5 do
+		local url = ("https://games.roblox.com/v1/games/%d/servers/Public?limit=100&excludeFullGames=true"):format(game.PlaceId)
+			.. (cursor and ("&cursor=" .. cursor) or "")
+		local ok, res = pcall(httpFn, {
+			Url = url, Method = "GET",
+			Headers = { ["User-Agent"] = "Roblox/WinInet", ["Accept"] = "application/json" },
+		})
+		if not ok or type(res) ~= "table" or not res.Body then break end
+		local code = statusOf(res)
+		if code == 429 then warn("[ROBSCAN] Roblox API 429 (list cached for reuse; set CONFIG.ServersUrl to avoid)") task.wait(10) break end
+		if code and code ~= 200 then break end
+		local okd, data = pcall(function() return HttpService:JSONDecode(res.Body) end)
+		if not okd or not data or not data.data then break end
+		for _, s in ipairs(data.data) do table.insert(all, s) end
+		cursor = data.nextPageCursor
+		if not cursor then break end
+	end
+	return all
+end
+local SERVERS_FILE = "robscan_servers.json"
+local SERVERS_TTL = 300 -- reuse a fetched server list this many seconds ACROSS hops (each hop is a fresh process)
+local function readServersFile()
+	if not (isfile and readfile and isfile(SERVERS_FILE)) then return nil end
+	local ok, d = pcall(function() return HttpService:JSONDecode(readfile(SERVERS_FILE)) end)
+	if ok and type(d) == "table" and type(d.data) == "table" and tonumber(d.fetchedAt)
+		and (os.time() - d.fetchedAt) < SERVERS_TTL and #d.data > 0 then
+		return d.data
+	end
+	return nil
+end
+local function getServers()
+	if #serverCache > 0 then return serverCache end
+	local cached = readServersFile()
+	if cached then serverCache = cached; return serverCache end -- fresh list on disk -> no Roblox call, instant pick
+	serverCache = fetchServers() or {}
+	if #serverCache > 0 and writefile then
+		pcall(function() writefile(SERVERS_FILE, HttpService:JSONEncode({ fetchedAt = os.time(), data = serverCache })) end)
+	end
+	return serverCache
+end
+local function stopRequested()
+	return CONFIG.StopFile ~= "" and isfile and isfile(CONFIG.StopFile)
+end
+local function persist()
+	if queue_on_teleport and CONFIG.SelfSource ~= "" then pcall(queue_on_teleport, CONFIG.SelfSource) end
+end
+local function serverHop(depth)
+	depth = depth or 0
+	if stopRequested() then warn("[ROBSCAN] stop file present â€” staying put") return end
+	if depth > 8 then warn("[ROBSCAN] hop exhausted â€” pausing 20s") task.wait(20) end
+	persist()
+	local now = os.time()
+	local useBrain = CONFIG.BrainUrl ~= ""
+	local brain = useBrain and pruneBrain(brainGet() or {}) or { v = localVisited(), c = {} }
+	brain.v[game.JobId] = now + CONFIG.RevisitCooldown
+	brain.c[game.JobId] = nil
+
+	-- fetch the server list; retry rather than ever matchmaking (matchmaking groups scouts together)
+	local servers
+	for attempt = 1, 4 do
+		servers = getServers()
+		if #servers > 0 then break end
+		warn("[ROBSCAN] server list empty (attempt " .. attempt .. ") â€” retrying")
+		task.wait(3)
+	end
+	servers = servers or {}
+	shuffle(servers)
+	local pick
+	for _, s in ipairs(servers) do
+		if s.id and s.id ~= game.JobId and not brain.v[s.id] and not brain.c[s.id]
+			and s.playing and s.maxPlayers and s.playing < s.maxPlayers then
+			pick = s.id
+			break
+		end
+	end
+	if pick then brain.c[pick] = now + CONFIG.ClaimTTL end
+	if useBrain then brainPut(brain) else saveLocalVisited(brain.v) end
+	if CONFIG.DebugPrint then print(("[ROBSCAN] hop: servers=%d pick=%s"):format(#servers, tostring(pick))) end
+
+	if not pick then
+		serverCache = {}  -- list exhausted / all visited -> force a fresh pull next hop
+		if delfile and isfile and isfile(SERVERS_FILE) then pcall(delfile, SERVERS_FILE) end
+		if depth >= 2 and not useBrain then
+			saveLocalVisited({})  -- the cooldown list is filtering out everything -> wipe it so we ALWAYS find a server (never deadlock)
+			warn("[ROBSCAN] every server filtered -> cleared visited cooldown")
+		end
+		warn("[ROBSCAN] no eligible server â€” retrying")
+		task.wait(2)
+		return serverHop(depth + 1)
+	end
+	if _G.__robscan then _G.__robscan._running = false end  -- release the guard BEFORE teleporting so the next server's autoexec run isn't blocked by a persisted _G
+	local okT = pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, pick, LP) end)
+	if not okT then
+		task.wait(2)
+		return serverHop(depth + 1)
+	end
+end
+
+-- async teleport failures (server filled up, Roblox error) -> pick another server
+TeleportService.TeleportInitFailed:Connect(function(player, result, msg)
+	if player ~= LP then return end
+	warn("[ROBSCAN] TeleportInitFailed: " .. tostring(result) .. " â€” " .. tostring(msg) .. " â€” re-hopping")
+	task.wait(1.5)
+	serverHop()
+end)
+
+-- ==== API + MAIN ====
+_G.__robscan = {
+	_running = true,
+	startedAt = os.time(),
+	snapshot = snapshot,
+	latest = nil,
+	config = CONFIG,
+	scanNow = function() local s = snapshot(); reportBot(s); return s end,
+	hop = serverHop,
+}
+
+-- ==== FAST SCAN READINESS (proceed the instant everything we need has replicated) ====
+local function activeState(st, n) return st[n] == "open" or st[n] == "in_progress" end
+local function focusPlaneStream()
+	if not planePaths then return end
+	local ok, p = pcall(function()
+		local len = planePaths.enter.ApproxTotalLength or planePaths.enter:ApproximateLength(1000)
+		return (planePaths.enter:GetWorldPositionAt(len * 0.5))
+	end)
+	if not ok or not p then return end
+	pcall(function() workspace.CurrentCamera.CFrame = CFrame.new(p + Vector3.new(0, 350, 0), p) end)
+	pcall(function() LP:RequestStreamAroundAsync(p) end)
+end
+local function scanReady()
+	if not canReadState() then return false end
+	local st = readStates()
+	if activeState(st, "CARGO_PLANE") and not findPlaneModel() then return false end
+	if activeState(st, "TRAIN_CARGO") and not trainMarkerPos("TrainCargo") then return false end
+	if activeState(st, "TRAIN_PASSENGER") and not trainMarkerPos("TrainPassenger") then return false end
+	return true
+end
+local function prefetchServers() task.spawn(function() pcall(getServers) end) end
+
+-- autoexec runs BEFORE RobberyState values replicate (they arrive CLOSED, then flip), so an early read finds only 1-2
+-- robberies. Wait until every state child is present AND the whole value-set holds steady for a few reads = settled.
+local function stateSignature()
+	local folder = stateFolderName and RS:FindFirstChild(stateFolderName)
+	if not folder then return nil, 0 end
+	local kids = folder:GetChildren()
+	local parts = {}
+	for _, v in ipairs(kids) do
+		local ok, val = pcall(function() return v.Value end)
+		parts[#parts + 1] = v.Name .. "=" .. tostring(ok and val or "?")
+	end
+	table.sort(parts)
+	return table.concat(parts, ","), #kids
+end
+local function waitForStableState()
+	local t0 = os.clock()
+	local last, stable = nil, 0
+	local want = expectedStateCount() -- 16 once Consts loaded; 0 -> rely on signature stability alone
+	repeat
+		task.wait(0.15)
+		local sig, n = stateSignature()
+		if sig and n > 0 and n >= want then
+			if sig == last then stable += 1 else stable = 0 end
+			last = sig
+		end
+	until stable >= 2 or (os.clock() - t0 > CONFIG.SettleSec)
+end
+
+-- the scanner is one-shot-per-server (autoexec re-runs after each teleport), so it MUST always end in a hop. beginHop
+-- guarantees exactly one initial hop whether the scan finished, errored, or hung.
+local hopStarted = false
+local function beginHop()
+	if hopStarted then return end
+	hopStarted = true
+	if CONFIG.Hop then serverHop() end
+end
+
+task.spawn(function()
+	-- WATCHDOG: if the scan ever hangs (game never loads, state never settles, plane stream stuck), force a hop so the
+	-- autoexec chain can NEVER dead-end on one server. A normal scan finishes well under this.
+	task.delay(45, function()
+		if not hopStarted then warn("[ROBSCAN] watchdog: scan stalled -> forcing hop") beginHop() end
+	end)
+	-- whole scan in a pcall: ANY error must still let us hop (a dead thread = the "script just stops" bug)
+	local ok, err = pcall(function()
+		if not game:IsLoaded() then game.Loaded:Wait() end -- autoexec fires before the game loads; wait or everything is half-ready
+		-- on autoexec the script-load loadConsts() ran before RobberyConsts replicated (Consts=nil -> empty idToName, nil
+		-- stateFolderName, statusWord prints raw numbers = "finds 1 robbery / acts wrong"). Retry until it resolves.
+		local lc0 = os.clock()
+		while not loadConsts() and os.clock() - lc0 < 10 do task.wait(0.2) end
+		loadPlaneFlight()
+		buildRobConsts()
+		if not planeOffsets then warn("[ROBSCAN] no cargo flight data â€” state-only") end
+		prefetchServers() -- warm the server-list file cache during settle so the hop fires with no fetch latency
+		waitForStableState() -- autoexec scans before values replicate -> "only 1 robbery"; wait for the full state to settle
+		markArrived()
+		-- only spend streaming time when a plane is actually active; every other server scans + hops immediately
+		if planeOffsets then
+			local st = readStates()
+			if activeState(st, "CARGO_PLANE") and not findPlaneModel() then
+				focusPlaneStream()
+				local s0 = os.clock()
+				repeat task.wait(0.1) until scanReady() or (os.clock() - s0 > CONFIG.StreamWait)
+			end
+		end
+		local snap = snapshot()
+		_G.__robscan.latest = snap
+		if CONFIG.DebugPrint then print(debugLine(snap)) end
+		reportBot(snap) -- the ONLY output: POST the live robbery states to the Discord bot
+	end)
+	if not ok then warn("[ROBSCAN] scan error -> hopping anyway: " .. tostring(err)) end
+	task.wait(0.2)
+	beginHop()
+end)
