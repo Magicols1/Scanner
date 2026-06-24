@@ -30,7 +30,7 @@ local CONFIG = {
 
 	-- ==== HOP / SCAN ====
 	Hop = true,               -- server-hop after each scan
-	MinSecPerServer = 25,     -- stay at least this long per server -> fewer teleports -> less stress on the executor's re-inject (raise if it still breaks)
+	MinSecPerServer = 5,     -- stay at least this long per server -> fewer teleports -> less stress on the executor's re-inject (raise if it still breaks)
 	StreamPlane = false,      -- OFF by default: RequestStreamAroundAsync + camera move is the one call most likely to crash the executor on a fresh-arrival; plane timing degrades to status/approx when off
 	SettleSec = 7,            -- max wait after join for robbery state to replicate
 	StreamWait = 3,           -- seconds after settling to let the game spawn the plane + replicate state
