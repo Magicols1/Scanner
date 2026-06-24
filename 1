@@ -38,6 +38,7 @@ local CONFIG = {
 	ClaimTTL = 90,            -- seconds a "planning to join" claim holds
 	StopFile = "robscan_stop.txt",
 	DebugPrint = true,
+	LowSpec = true,           -- headless scanning: kill 3D rendering + drop graphics so the emulator isn't drawing a world we never look at (big FPS/lag win on MuMu). UI + state reads are unaffected.
 	-- self-perpetuate across hops: on each teleport we queue_on_teleport a loader that re-fetches + runs this raw link,
 	-- so re-exec NEVER depends on autoexec firing on arrival. Keep the GitHub file = this script.
 	SelfUrl = "",
@@ -69,6 +70,19 @@ if _G.__robscan and _G.__robscan._running and _G.__robscan.startedAt and (os.tim
 	warn("[ROBSCAN] already running this session")
 	return
 end
+-- ==== LOW-SPEC (the scanner never needs to SEE the game -- only read state + marker positions, which are replicated
+-- data, not rendering). Killing the 3D render + dropping quality cuts the emulator's load hard. All pcall'd so a missing
+-- API can never break the scan. UI (minimap) + physics + replication are untouched. ====
+if CONFIG.LowSpec then
+	pcall(function() game:GetService("RunService"):Set3dRenderingEnabled(false) end)
+	pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+	pcall(function() sethiddenproperty(settings().Rendering, "QualityLevel", 1) end)
+	pcall(function() local L = game:GetService("Lighting"); L.GlobalShadows = false; L.FogEnd = 9e9 end)
+	pcall(function() for _, e in ipairs(game:GetService("Lighting"):GetDescendants()) do if e:IsA("PostEffect") then e.Enabled = false end end end)
+	pcall(function() for _, e in ipairs(workspace:GetDescendants()) do if e:IsA("ParticleEmitter") or e:IsA("Trail") or e:IsA("Smoke") or e:IsA("Fire") then e.Enabled = false end end end)
+	if CONFIG.DebugPrint then print("[ROBSCAN] low-spec: 3D rendering OFF + min quality") end
+end
+
 -- seed per-account so scouts shuffle/pick DIFFERENT servers (UserId is the differentiator)
 math.randomseed(LP.UserId + math.floor(os.clock() * 1000) + os.time())
 
@@ -649,8 +663,121 @@ local function stationaryTiming(name)
 	return left, os.time() + math.floor(left + 0.5), (src or "?") .. "/" .. base
 end
 
+-- ==== BOUNTY / PLAYER MAP ====
+-- Every player's world position WITHOUT needing them streamed: the game keeps a server-position value on each player's
+-- Humanoid (HumanoidUnloadConsts.SERVER_POSITION_OBJ_NAME) -- the exact source the PlayerMarker system reads. Paired
+-- with BountyData ([{UserId,Bounty,Name}]) -> a per-server snapshot of who is where + worth how much.
+local MAP_SCALE, MAP_U0, MAP_V0 = 0.00010013, 0.482893, 0.655032
+local _serverPosName
+local function serverPosName()
+	if _serverPosName == nil then
+		local hu = req(child(RS, "HumanoidUnload", "HumanoidUnloadConsts"))
+		_serverPosName = (hu and hu.SERVER_POSITION_OBJ_NAME) or false
+	end
+	return _serverPosName or nil
+end
+local function bountyTable()
+	local out, bd = {}, RS:FindFirstChild("BountyData")
+	if not bd then return out end
+	local ok, list = pcall(function() return HttpService:JSONDecode(bd.Value) end)
+	if ok and type(list) == "table" then
+		for _, e in ipairs(list) do
+			if e.UserId then out[e.UserId] = tonumber((tostring(e.Bounty):gsub("[^%d]", ""))) or 0 end
+		end
+	end
+	return out
+end
+local function playerWorldPos(plr)
+	local char = plr.Character
+	if not char then return nil end
+	local pp = char.PrimaryPart or char:FindFirstChild("HumanoidRootPart")
+	if pp then return pp.Position end
+	local hum, nm = char:FindFirstChild("Humanoid"), serverPosName()
+	local sp = hum and nm and hum:FindFirstChild(nm)
+	if sp then local ok, val = pcall(function() return sp.Value end); if ok and typeof(val) == "Vector3" then return val end end
+	return nil
+end
+local function teamOf(plr)
+	local tv = plr:FindFirstChild("TeamValue")
+	local ok, v = pcall(function() return tv and tv.Value end)
+	if ok and v ~= nil then local s = tostring(v):lower(); if s:find("police") then return "police" elseif s:find("criminal") then return "criminal" end end
+	return nil
+end
+local function playerScan()
+	local bounties, list = bountyTable(), {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LP then
+			local pos = playerWorldPos(plr)
+			if pos then
+				list[#list + 1] = {
+					name = plr.Name, userId = plr.UserId, bounty = bounties[plr.UserId] or 0,
+					u = math.floor((MAP_SCALE * pos.X + MAP_U0) * 1e4 + 0.5) / 1e4,
+					v = math.floor((MAP_SCALE * pos.Z + MAP_V0) * 1e4 + 0.5) / 1e4,
+					team = teamOf(plr),
+				}
+			end
+		end
+	end
+	return list
+end
+
+-- ==== CROWN JEWEL / CASINO KEYPAD CODE (per server) ====
+-- When the Casino robbery is open we briefly stream the building in + read the 4-digit RobberyDoor keypad code off the
+-- spawned digit parts (ported from Robbery's/Casino/CasinoAuto.lua). The code is per-server -> reported so the tracker shows it.
+local function casinoWorldPos()
+	local c = workspace:FindFirstChild("Casino")
+	if c then local ok, cf = pcall(function() return c:GetPivot() end); if ok and cf and cf.Position.Magnitude > 1 then return cf.Position end end
+	return Vector3.new((0.5833 - MAP_U0) / MAP_SCALE, 20, (0.2750 - MAP_V0) / MAP_SCALE)
+end
+local function casinoCodeFolders()
+	local c = workspace:FindFirstChild("Casino")
+	local rd = c and c:FindFirstChild("RobberyDoor")
+	local codes = rd and rd:FindFirstChild("Codes")
+	local out = {}
+	if codes then for _, f in ipairs(codes:GetChildren()) do if #f:GetChildren() > 0 then out[#out + 1] = f end end end
+	return out
+end
+local function readOneCode(folder)
+	local items = {}
+	for _, p in ipairs(folder:GetChildren()) do
+		if p:IsA("BasePart") then
+			local lbl = p:FindFirstChildWhichIsA("TextLabel", true)
+			local digit = lbl and lbl.Text and lbl.Text:match("%d")
+			if digit then items[#items + 1] = { d = digit, cf = p.CFrame } end
+		end
+	end
+	if #items < 4 then return nil end
+	local mn, mx = items[1].cf.Position, items[1].cf.Position
+	for _, it in ipairs(items) do mn = mn:Min(it.cf.Position); mx = mx:Max(it.cf.Position) end
+	local sp = mx - mn
+	if sp.Y > sp.X and sp.Y > sp.Z then
+		table.sort(items, function(a, b) return a.cf.Position.Y > b.cf.Position.Y end)
+	else
+		local right = items[1].cf.RightVector
+		table.sort(items, function(a, b) return a.cf.Position:Dot(right) > b.cf.Position:Dot(right) end)
+	end
+	local code = ""; for _, it in ipairs(items) do code ..= it.d end
+	return #code == 4 and code or nil
+end
+local function readCasinoCode()
+	pcall(function() LP:RequestStreamAroundAsync(casinoWorldPos()) end)
+	local t0 = os.clock()
+	repeat
+		if #casinoCodeFolders() > 0 then break end
+		task.wait(0.15)
+	until os.clock() - t0 > 4
+	local counts, best, bc = {}, nil, 0
+	for _, f in ipairs(casinoCodeFolders()) do local code = readOneCode(f); if code then counts[code] = (counts[code] or 0) + 1 end end
+	for code, n in pairs(counts) do if n > bc then bc, best = n, code end end
+	return best
+end
+
 local function snapshot()
 	local states = readStates()
+	local cc
+	if states.CASINO == "open" or states.CASINO == "in_progress" or states.CROWN_JEWEL == "open" or states.CROWN_JEWEL == "in_progress" then
+		cc = readCasinoCode()
+	end
 	return {
 		jobId = game.JobId,
 		placeId = game.PlaceId,
@@ -661,6 +788,8 @@ local function snapshot()
 		cargoPlane = planeReport(states),
 		trains = trainReport(),
 		ship = shipReport(),
+		bounties = playerScan(),
+		casinoCode = cc,
 	}
 end
 
@@ -716,6 +845,10 @@ local function reportBot(snap)
 				entry.endsAt = endsAt
 				if CONFIG.DebugPrint then print(("[ROBSCAN] timer %s: %ds left (closes %d) src=%s"):format(name, math.floor(left), endsAt, tostring(src))) end
 			end
+			if (name == "CASINO" or name == "CROWN_JEWEL") and snap.casinoCode then
+				entry.code = snap.casinoCode
+				if CONFIG.DebugPrint then print("[ROBSCAN] casino keypad code = " .. tostring(snap.casinoCode)) end
+			end
 			list[#list + 1] = entry
 		end
 	end
@@ -723,6 +856,7 @@ local function reportBot(snap)
 	local body = HttpService:JSONEncode({
 		token = CONFIG.RobberyToken, user = LP.Name, jobId = snap.jobId, placeId = snap.placeId,
 		players = snap.players, maxPlayers = snap.maxPlayers, ts = snap.ts, robberies = list,
+		bounties = snap.bounties,
 	})
 	local ok, res = send("POST", CONFIG.BotUrl, body)
 	local code = (type(res) == "table" and (res.StatusCode or res.Status)) or (ok and "?" or tostring(res))
