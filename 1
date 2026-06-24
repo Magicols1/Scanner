@@ -64,7 +64,7 @@ end
 -- block a genuine double-run, but NOT the post-teleport autoexec run: Potassium's _G can persist across hops, so a
 -- stale _running would wrongly block the next server (= "sometimes doesn't execute"). Only honor it if a run actually
 -- started in the last 25s (a live scan); older than that the previous run died/teleported, so let this one go.
-if _G.__robscan and _G.__robscan._running and _G.__robscan.startedAt and (os.time() - _G.__robscan.startedAt) < 25 then
+if _G.__robscan and _G.__robscan._running and _G.__robscan.startedAt and (os.time() - _G.__robscan.startedAt) < 5 then
 	warn("[ROBSCAN] already running this session")
 	return
 end
@@ -968,7 +968,7 @@ task.spawn(function()
 	local arrivedAt = os.clock()
 	-- WATCHDOG: if the scan ever hangs (game never loads, state never settles, plane stream stuck), force a hop so the
 	-- autoexec chain can NEVER dead-end on one server. A normal scan finishes well under this.
-	task.delay(math.max(45, CONFIG.MinSecPerServer + 25), function()
+	task.delay(math.max(45, CONFIG.MinSecPerServer + 5), function()
 		if not hopStarted then warn("[ROBSCAN] watchdog: scan stalled -> forcing hop") beginHop() end
 	end)
 	-- whole scan in a pcall: ANY error must still let us hop (a dead thread = the "script just stops" bug)
