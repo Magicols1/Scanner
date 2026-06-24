@@ -890,9 +890,14 @@ TeleportService.TeleportInitFailed:Connect(function(player, result, msg)
 end)
 
 -- ==== API + MAIN ====
+-- hop counter survives across hops IF the executor reuses its Lua state (_G persists). If it climbs each hop, the break
+-- is ACCUMULATIVE (a leak we can hunt); if it stays #1, _G resets every hop = Potassium re-injects fresh = per-hop crash.
+local _hops = ((_G.__robscan and tonumber(_G.__robscan.hops)) or 0) + 1
+print(("[ROBSCAN] === starting hop #%d (session) ==="):format(_hops))
 _G.__robscan = {
 	_running = true,
 	startedAt = os.time(),
+	hops = _hops,
 	snapshot = snapshot,
 	latest = nil,
 	config = CONFIG,
