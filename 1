@@ -30,6 +30,8 @@ local CONFIG = {
 
 	-- ==== HOP / SCAN ====
 	Hop = true,               -- server-hop after each scan
+	MinSecPerServer = 25,     -- stay at least this long per server -> fewer teleports -> less stress on the executor's re-inject (raise if it still breaks)
+	StreamPlane = false,      -- OFF by default: RequestStreamAroundAsync + camera move is the one call most likely to crash the executor on a fresh-arrival; plane timing degrades to status/approx when off
 	SettleSec = 7,            -- max wait after join for robbery state to replicate
 	StreamWait = 3,           -- seconds after settling to let the game spawn the plane + replicate state
 	RevisitCooldown = 600,    -- seconds before any scout may revisit a JobId
@@ -958,9 +960,10 @@ local function beginHop()
 end
 
 task.spawn(function()
+	local arrivedAt = os.clock()
 	-- WATCHDOG: if the scan ever hangs (game never loads, state never settles, plane stream stuck), force a hop so the
 	-- autoexec chain can NEVER dead-end on one server. A normal scan finishes well under this.
-	task.delay(45, function()
+	task.delay(math.max(45, CONFIG.MinSecPerServer + 25), function()
 		if not hopStarted then warn("[ROBSCAN] watchdog: scan stalled -> forcing hop") beginHop() end
 	end)
 	-- whole scan in a pcall: ANY error must still let us hop (a dead thread = the "script just stops" bug)
@@ -976,8 +979,8 @@ task.spawn(function()
 		prefetchServers() -- warm the server-list file cache during settle so the hop fires with no fetch latency
 		waitForStableState() -- autoexec scans before values replicate -> "only 1 robbery"; wait for the full state to settle
 		markArrived()
-		-- only spend streaming time when a plane is actually active; every other server scans + hops immediately
-		if planeOffsets then
+		-- plane streaming is OFF by default (RequestStreamAroundAsync + camera = top executor-crash risk on arrival)
+		if planeOffsets and CONFIG.StreamPlane then
 			local st = readStates()
 			if activeState(st, "CARGO_PLANE") and not findPlaneModel() then
 				focusPlaneStream()
@@ -991,6 +994,7 @@ task.spawn(function()
 		reportBot(snap) -- the ONLY output: POST the live robbery states to the Discord bot
 	end)
 	if not ok then warn("[ROBSCAN] scan error -> hopping anyway: " .. tostring(err)) end
-	task.wait(0.2)
+	-- pace the hop: stay >= MinSecPerServer so we teleport LESS often (every teleport risks the executor not re-attaching)
+	while os.clock() - arrivedAt < CONFIG.MinSecPerServer and not hopStarted do task.wait(0.5) end
 	beginHop()
 end)
