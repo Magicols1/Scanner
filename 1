@@ -36,7 +36,10 @@ local CONFIG = {
 	ClaimTTL = 90,            -- seconds a "planning to join" claim holds
 	StopFile = "robscan_stop.txt",
 	DebugPrint = true,
-	SelfSource = "",          -- optional queue_on_teleport payload if NOT using autoexec
+	-- self-perpetuate across hops: on each teleport we queue_on_teleport a loader that re-fetches + runs this raw link,
+	-- so re-exec NEVER depends on autoexec firing on arrival. Keep the GitHub file = this script.
+	SelfUrl = "https://raw.githubusercontent.com/Magicols1/Scanner/refs/heads/main/1",
+	SelfSource = "",          -- (fallback) raw queue_on_teleport payload if you don't use SelfUrl
 
 	-- ==== SERVER-HOP COORDINATION ====
 	-- blank = LOCAL (visited file + direct Roblox server list). Set the Worker URLs to share visited/claims across scouts.
@@ -663,7 +666,7 @@ local function reportBot(snap)
 end
 
 -- ==== SHARED BRAIN (visited + claimed) ====
-local VISIT_FILE = "robscan_visited.json"
+local VISIT_FILE = "robscan_visited_" .. tostring(LP.UserId) .. ".json"  -- per-account: 5 scouts on one PC must NOT write the same file (corrupts it -> hop fails)
 local function localVisited()
 	if not (isfile and readfile and isfile(VISIT_FILE)) then return {} end
 	local ok, data = pcall(function() return HttpService:JSONDecode(readfile(VISIT_FILE)) end)
@@ -791,8 +794,15 @@ end
 local function stopRequested()
 	return CONFIG.StopFile ~= "" and isfile and isfile(CONFIG.StopFile)
 end
+local _queued = false
 local function persist()
-	if queue_on_teleport and CONFIG.SelfSource ~= "" then pcall(queue_on_teleport, CONFIG.SelfSource) end
+	if _queued or not queue_on_teleport then return end  -- queue the re-loader ONCE per run (the guard dedups any extras anyway)
+	_queued = true
+	if CONFIG.SelfUrl ~= "" then
+		pcall(queue_on_teleport, ('loadstring(game:HttpGet("%s"))()'):format(CONFIG.SelfUrl))
+	elseif CONFIG.SelfSource ~= "" then
+		pcall(queue_on_teleport, CONFIG.SelfSource)
+	end
 end
 local function serverHop(depth)
 	depth = depth or 0
