@@ -44,8 +44,9 @@ local CONFIG = {
 	SelfSource = "",          -- (fallback) raw queue_on_teleport payload if you don't use SelfUrl
 
 	-- ==== SERVER-HOP COORDINATION ====
-	-- blank = LOCAL (visited file + direct Roblox server list). Set the Worker URLs to share visited/claims across scouts.
-	BrainUrl = "",
+	-- blank = LOCAL (per-account visited file). Set BrainUrl to the bot's /brain so all scouts SHARE visited/claimed and
+	-- split servers instead of overlapping. Token goes in the query (must equal the bot's ROBBERY_TOKEN).
+	BrainUrl = "https://buster-production-930c.up.railway.app/brain?token=090910293021",
 	ServersUrl = "",
 	BrainHeaders = {},
 	BrainPutMethod = "POST",
@@ -718,9 +719,9 @@ local function reportBot(snap)
 			list[#list + 1] = entry
 		end
 	end
-	if #list == 0 then return end
+	-- always POST (even with nothing open) so the bot knows this scout is alive for the active-bots page; sends our username
 	local body = HttpService:JSONEncode({
-		token = CONFIG.RobberyToken, jobId = snap.jobId, placeId = snap.placeId,
+		token = CONFIG.RobberyToken, user = LP.Name, jobId = snap.jobId, placeId = snap.placeId,
 		players = snap.players, maxPlayers = snap.maxPlayers, ts = snap.ts, robberies = list,
 	})
 	local ok, res = send("POST", CONFIG.BotUrl, body)
