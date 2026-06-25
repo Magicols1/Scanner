@@ -1170,6 +1170,7 @@ task.spawn(function()
 	-- whole scan in a pcall: ANY error must still let us hop (a dead thread = the "script just stops" bug)
 	local ok, err = pcall(function()
 		if not game:IsLoaded() then game.Loaded:Wait() end -- autoexec fires before the game loads; wait or everything is half-ready
+		local tLoaded = os.clock() - arrivedAt
 		-- on autoexec the script-load loadConsts() ran before RobberyConsts replicated (Consts=nil -> empty idToName, nil
 		-- stateFolderName, statusWord prints raw numbers = "finds 1 robbery / acts wrong"). Retry until it resolves.
 		local lc0 = os.clock()
@@ -1179,6 +1180,7 @@ task.spawn(function()
 		if not planeOffsets then warn("[ROBSCAN] no cargo flight data â€” state-only") end
 		prefetchServers() -- warm the server-list file cache during settle so the hop fires with no fetch latency
 		waitForStableState() -- autoexec scans before values replicate -> "only 1 robbery"; wait for the full state to settle
+		local tSettled = os.clock() - arrivedAt
 		markArrived()
 		-- plane streaming is OFF by default (RequestStreamAroundAsync + camera = top executor-crash risk on arrival)
 		if planeOffsets and CONFIG.StreamPlane then
@@ -1193,6 +1195,7 @@ task.spawn(function()
 		_G.__robscan.latest = snap
 		if CONFIG.DebugPrint then print(debugLine(snap)) end
 		reportBot(snap) -- the ONLY output: POST the live robbery states to the Discord bot
+		if CONFIG.DebugPrint then print(("[ROBSCAN] timing: load=%.1fs settle=%.1fs post=%.1fs total=%.1fs"):format(tLoaded, tSettled - tLoaded, (os.clock() - arrivedAt) - tSettled, os.clock() - arrivedAt)) end
 	end)
 	if not ok then warn("[ROBSCAN] scan error -> hopping anyway: " .. tostring(err)) end
 	-- pace the hop: stay >= MinSecPerServer so we teleport LESS often (every teleport risks the executor not re-attaching)
